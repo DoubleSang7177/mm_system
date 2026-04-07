@@ -204,6 +204,13 @@ def run_backtest(
                 "max_inventory": config.max_inventory,
                 "alpha": alpha_val if np.isfinite(alpha_val) else None,
             }
+            if "liquidity_k" in market.columns:
+                try:
+                    k_val = float(market["liquidity_k"].iloc[i])
+                    if np.isfinite(k_val):
+                        q_kwargs["liquidity_k"] = k_val
+                except (TypeError, ValueError):
+                    pass
             q_kwargs.update(config.extra_engine_kwargs)
             bid_q, ask_q = engine.quote_prices_clamped(s_mid, inv, **q_kwargs)
 
@@ -384,6 +391,11 @@ def run_backtest(
             if config.alpha_signal_col in market.columns:
                 row_state["alpha_signal"] = alpha_val
                 row_state["alpha_trade_ok"] = bool(alpha_ok)
+            qdbg = engine.last_quote
+            if qdbg:
+                row_state["K"] = float(qdbg.get("K", np.nan))
+                row_state["spread"] = float(qdbg.get("spread", np.nan))
+                row_state["fill_prob"] = float(qdbg.get("fill_prob", np.nan))
             rows_state.append(row_state)
     finally:
         engine.update_horizon(orig_tau)

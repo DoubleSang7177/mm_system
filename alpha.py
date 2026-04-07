@@ -1,6 +1,5 @@
 """
-强化版多档 OFI alpha：加权、滚动统计、z-score、去噪、tanh → [-1,1]。
-兼容 run.py：XGBoostAlphaConfig / XGBoostAlphaModel 接口（无 XGBoost 训练）。
+Multi-level OFI + Trade Flow alpha (strictly causal).
 """
 
 from __future__ import annotations
@@ -11,6 +10,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from features import multi_level_ofi, rolling_zscore, trade_flow
+
 
 def _norm_lower_cols(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
@@ -18,73 +19,24 @@ def _norm_lower_cols(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _level_volume_array(df: pd.DataFrame, side: str, n_levels: int) -> np.ndarray:
-    """(n_rows, n_levels) 向量化；缺列用 0。"""
-    n = len(df)
-    out = np.zeros((n, n_levels), dtype=np.float64)
-    for i in range(1, n_levels + 1):
-        candidates = (
-            f"{side}_volume_{i}",
-            f"{side}_size_{i}",
-            f"{side}_vol_{i}",
-        )
-        col = None
-        for c in candidates:
-            if c in df.columns:
-                col = c
-                break
-        if col is None and i == 1:
-            fallback = "bid_size" if side == "bid" else "ask_size"
-            if fallback in df.columns:
-                col = fallback
-        if col is not None:
-            out[:, i - 1] = df[col].to_numpy(dtype=np.float64, copy=False)
-    return out
-
-
-def _level_weights(n_levels: int, mode: str, decay_lambda: float) -> np.ndarray:
-    if mode == "exp":
-        w = np.exp(-decay_lambda * np.arange(n_levels, dtype=np.float64))
-    else:
-        w = 1.0 / np.arange(1, n_levels + 1, dtype=np.float64)
-    return w
-
-
-def _rolling_mean_np(x: np.ndarray, window: int) -> np.ndarray:
-    s = pd.Series(x)
-    return s.rolling(window=window, min_periods=max(2, window // 2)).mean().to_numpy()
-
-
-def _rolling_std_np(x: np.ndarray, window: int) -> np.ndarray:
-    s = pd.Series(x)
-    return s.rolling(window=window, min_periods=max(2, window // 2)).std(ddof=0).to_numpy()
-
-
-def compute_weighted_ofi_per_level_vec(df: pd.DataFrame, n_levels: int, noise_threshold: float, weights: np.ndarray):
-    """纯向量化 Δ（与 df 行对齐）。"""
-    bv = _level_volume_array(df, "bid", n_levels)
-    av = _level_volume_array(df, "ask", n_levels)
-    db = np.zeros_like(bv)
-    da = np.zeros_like(av)
-    db[1:] = np.diff(bv, axis=0)
-    da[1:] = np.diff(av, axis=0)
-    small = (np.abs(db) + np.abs(da)) < noise_threshold
-    db = np.where(small, 0.0, db)
-    da = np.where(small, 0.0, da)
-    ofi_l = db - da
-    ofi_total = (ofi_l * weights.reshape(1, -1)).sum(axis=1)
-    return ofi_l, ofi_total
-
-
 @dataclass
 class OFIAlphaConfig:
-    n_levels: int = 5
-    window: int = 10
-    noise_threshold: float = 1e-9
-    clip_z: float = 3.0
-    weight_mode: str = "inverse_level"
-    decay_lambda: float = 0.35
+    # Multi-level OFI
+    ofi_levels: tuple[int, int, int] = (1, 2, 3)
+    ofi_weights: tuple[float, float, float] = (0.6, 0.3, 0.1)
+    noise_threshold: float = 0.0
+
+    # Trade flow + normalization
+    zscore_window: int = 50
+    clip_z: float = 4.0
     eps: float = 1e-6
+
+    # alpha = a * OFI_total_z + b * TradeFlow_z
+    a: float = 0.7
+    b: float = 0.3
+    auto_flip_sign: bool = True
+
+    # evaluation and compatibility fields
     horizon: int = 3
     train_fraction: float = 0.7
     vol_window: int = 20
@@ -105,27 +57,89 @@ class OFIAlphaConfig:
     extra_params: dict[str, Any] = field(default_factory=dict)
 
 
+def _safe_std(s: pd.Series) -> pd.Series:
+    out = s.astype(float)
+    return out.replace([np.inf, -np.inf], np.nan)
+
+
+def _extract_trade_flow(df: pd.DataFrame) -> pd.Series:
+    d = _norm_lower_cols(df)
+    if "buy_volume" in d.columns and "sell_volume" in d.columns:
+        return trade_flow(d["buy_volume"], d["sell_volume"])
+    if "trade_flow" in d.columns:
+        return pd.to_numeric(d["trade_flow"], errors="coerce").astype(float).fillna(0.0).rename("trade_flow")
+    return pd.Series(0.0, index=d.index, dtype=float, name="trade_flow")
+
+
+def build_ml_feature_matrix(
+    book: pd.DataFrame,
+    vol_window: int = 20,
+    lookback: int = 10,
+    momentum_lags: tuple[int, ...] = (1, 3, 5),
+    eps: float = 1e-12,
+) -> pd.DataFrame:
+    cfg = OFIAlphaConfig(zscore_window=max(lookback, 20))
+    d = _norm_lower_cols(book)
+
+    ofi_df = multi_level_ofi(
+        d,
+        levels=cfg.ofi_levels,
+        weights=cfg.ofi_weights,
+        noise_threshold=cfg.noise_threshold,
+    )
+    tf = _extract_trade_flow(d)
+
+    ofi_l1_z = rolling_zscore(ofi_df["ofi_l1"], window=cfg.zscore_window).rename("ofi_l1_z")
+    ofi_l2_z = rolling_zscore(ofi_df["ofi_l2"], window=cfg.zscore_window).rename("ofi_l2_z")
+    ofi_l3_z = rolling_zscore(ofi_df["ofi_l3"], window=cfg.zscore_window).rename("ofi_l3_z")
+    ofi_total_z = rolling_zscore(ofi_df["ofi_total"], window=cfg.zscore_window).rename("ofi_total_z")
+    trade_flow_z = rolling_zscore(tf, window=cfg.zscore_window).rename("trade_flow_z")
+
+    feature_df = pd.DataFrame(
+        {
+            "ofi_l1": _safe_std(ofi_df["ofi_l1"]),
+            "ofi_l2": _safe_std(ofi_df["ofi_l2"]),
+            "ofi_l3": _safe_std(ofi_df["ofi_l3"]),
+            "ofi_total": _safe_std(ofi_df["ofi_total"]),
+            "trade_flow": _safe_std(tf),
+            "ofi_l1_z": _safe_std(ofi_l1_z).clip(-cfg.clip_z, cfg.clip_z),
+            "ofi_l2_z": _safe_std(ofi_l2_z).clip(-cfg.clip_z, cfg.clip_z),
+            "ofi_l3_z": _safe_std(ofi_l3_z).clip(-cfg.clip_z, cfg.clip_z),
+            "ofi_total_z": _safe_std(ofi_total_z).clip(-cfg.clip_z, cfg.clip_z),
+            "trade_flow_z": _safe_std(trade_flow_z).clip(-cfg.clip_z, cfg.clip_z),
+        },
+        index=d.index,
+    )
+    return feature_df
+
+
 def compute_alpha(df: pd.DataFrame, config: OFIAlphaConfig | None = None) -> pd.Series:
-    """
-    多档加权 OFI → 滚动 z-score → clip → tanh，输出 alpha ∈ [-1, 1]。
-    """
     cfg = config or OFIAlphaConfig()
     d = _norm_lower_cols(df)
-    n_levels = int(cfg.n_levels)
-    w = _level_weights(n_levels, cfg.weight_mode, cfg.decay_lambda)
-    _, ofi_total = compute_weighted_ofi_per_level_vec(
-        d, n_levels, cfg.noise_threshold, w
+    ofi_df = multi_level_ofi(
+        d,
+        levels=cfg.ofi_levels,
+        weights=cfg.ofi_weights,
+        noise_threshold=cfg.noise_threshold,
     )
-    idx = d.index
-    mu = _rolling_mean_np(ofi_total, cfg.window)
-    sd = _rolling_std_np(ofi_total, cfg.window)
-    sd = np.where(sd < cfg.eps, cfg.eps, sd)
-    ofi_z = (ofi_total - mu) / sd
-    ofi_z = np.clip(ofi_z, -cfg.clip_z, cfg.clip_z)
-    alpha = np.tanh(ofi_z)
-    out = pd.Series(alpha, index=idx, name="alpha")
-    out = out.replace([np.inf, -np.inf], np.nan)
-    return out
+    tf = _extract_trade_flow(d)
+
+    ofi_total_z = rolling_zscore(ofi_df["ofi_total"], window=cfg.zscore_window)
+    trade_flow_z = rolling_zscore(tf, window=cfg.zscore_window)
+    ofi_total_z = (
+        ofi_total_z.replace([np.inf, -np.inf], np.nan)
+        .clip(-cfg.clip_z, cfg.clip_z)
+        .fillna(0.0)
+    )
+    trade_flow_z = (
+        trade_flow_z.replace([np.inf, -np.inf], np.nan)
+        .clip(-cfg.clip_z, cfg.clip_z)
+        .fillna(0.0)
+    )
+
+    alpha_raw = cfg.a * ofi_total_z + cfg.b * trade_flow_z
+    alpha = np.tanh(alpha_raw)
+    return pd.Series(alpha, index=d.index, name="alpha").clip(-1.0, 1.0)
 
 
 def forward_log_return(mid: pd.Series, horizon: int = 3) -> pd.Series:
@@ -192,48 +206,15 @@ def evaluate_alpha_signal(
     }
 
 
-def build_ml_feature_matrix(
-    book: pd.DataFrame,
-    vol_window: int = 20,
-    lookback: int = 10,
-    momentum_lags: tuple[int, ...] = (1, 3, 5),
-    eps: float = 1e-12,
-) -> pd.DataFrame:
-    """研究用特征表：强化 OFI 分量 + 滚动量（与 vol_window/lookback 对齐）。"""
-    cfg = OFIAlphaConfig(window=lookback, vol_window=vol_window)
-    d = _norm_lower_cols(book)
-    n_levels = cfg.n_levels
-    w = _level_weights(n_levels, cfg.weight_mode, cfg.decay_lambda)
-    ofi_l, ofi_total = compute_weighted_ofi_per_level_vec(
-        d, n_levels, cfg.noise_threshold, w
-    )
-    roll_sum = pd.Series(ofi_total).rolling(lookback, min_periods=max(2, lookback // 2)).sum()
-    roll_m = pd.Series(ofi_total).rolling(lookback, min_periods=max(2, lookback // 2)).mean()
-    roll_s = pd.Series(ofi_total).rolling(lookback, min_periods=max(2, lookback // 2)).std(ddof=0)
-
-    cols: dict[str, pd.Series] = {
-        "ofi_total_raw": pd.Series(ofi_total, index=d.index),
-        "ofi_roll_sum": roll_sum,
-        "ofi_roll_mean": roll_m,
-        "ofi_roll_std": roll_s,
-        "alpha_ofi": compute_alpha(book, OFIAlphaConfig(window=lookback, n_levels=n_levels)),
-    }
-    for j in range(n_levels):
-        cols[f"ofi_level_{j+1}"] = pd.Series(ofi_l[:, j], index=d.index)
-
-    return pd.DataFrame(cols, index=d.index)
-
-
 XGBoostAlphaConfig = OFIAlphaConfig
 AlphaMLConfig = OFIAlphaConfig
 
 
 class XGBoostAlphaModel:
-    """无监督 OFI alpha：fit 仅保存配置；预测为 compute_alpha。"""
-
     def __init__(self, config: OFIAlphaConfig | None = None) -> None:
         self._config = config or OFIAlphaConfig()
         self._fitted = False
+        self._alpha_sign = 1.0
 
     @property
     def config(self) -> OFIAlphaConfig:
@@ -264,7 +245,23 @@ class XGBoostAlphaModel:
         n_train = min(n_train, n - 20)
         iloc_tr = idx[:n_train]
         iloc_te = idx[n_train:]
-        alpha_te = alpha_full.reindex(iloc_te)
+
+        if cfg.auto_flip_sign:
+            tr_eval = evaluate_alpha_signal(
+                alpha_full.reindex(iloc_tr),
+                mid.reindex(iloc_tr),
+                horizon=cfg.horizon,
+                n_buckets=3,
+            )
+            ic_tr = float(tr_eval.get("ic_pearson", np.nan))
+            if np.isfinite(ic_tr) and ic_tr < 0.0:
+                self._alpha_sign = -1.0
+            else:
+                self._alpha_sign = 1.0
+        else:
+            self._alpha_sign = 1.0
+
+        alpha_te = self._alpha_sign * alpha_full.reindex(iloc_te)
         mid_te = mid.reindex(iloc_te)
         ev = evaluate_alpha_signal(alpha_te, mid_te, horizon=cfg.horizon, n_buckets=3)
         y_up = forward_price_up_label(mid, horizon=cfg.horizon).reindex(iloc_te)
@@ -292,12 +289,12 @@ class XGBoostAlphaModel:
         return self
 
     def predict_proba_up(self, book: pd.DataFrame) -> pd.Series:
-        a = compute_alpha(book, self._config)
+        a = self._alpha_sign * compute_alpha(book, self._config)
         p = (a + 1.0) / 2.0
         return p.clip(0.0, 1.0).rename("alpha_proba_up")
 
     def predict_alpha_score(self, book: pd.DataFrame) -> pd.Series:
-        return compute_alpha(book, self._config)
+        return (self._alpha_sign * compute_alpha(book, self._config)).rename("alpha")
 
 
 AlphaMLModel = XGBoostAlphaModel

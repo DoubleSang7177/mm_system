@@ -10,6 +10,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from features import estimate_liquidity_k
 
 APP_ROOT = Path(__file__).resolve().parent
 FRONTEND_DIR = APP_ROOT / "frontend"
@@ -143,6 +144,9 @@ def _compute_metrics() -> dict[str, Any]:
             "trades": 0,
             "inventory": 0.0,
             "fees": 0.0,
+            "K": 1.0,
+            "spread": 0.5,
+            "fill_prob": 1.0,
             "price_series": [],
             "pnl_series": [],
         }
@@ -230,6 +234,17 @@ def _compute_metrics() -> dict[str, Any]:
 
     finite_pnl = pnl_series[np.isfinite(pnl_series)]
     pnl = float(finite_pnl[-1]) if len(finite_pnl) else 0.0
+    try:
+        k_series = estimate_liquidity_k(ob, tr, window=500)
+        k_now = float(k_series.iloc[-1]) if len(k_series) else 1.0
+    except Exception:
+        k_now = 1.0
+    k_now = float(np.clip(k_now, 0.01, 100.0))
+    sigma_now = float(pd.Series(mid).rolling(window=100, min_periods=2).std(ddof=0).iloc[-1]) if len(mid) else 0.0
+    if not math.isfinite(sigma_now):
+        sigma_now = 0.0
+    spread_now = float(max(0.1 * (sigma_now**2) + 1.0 / k_now, 0.5))
+    fill_prob_now = float(np.exp(-k_now * (0.5 * spread_now)))
     return {
         "pnl": pnl,
         "ic": float(ic),
@@ -237,6 +252,9 @@ def _compute_metrics() -> dict[str, Any]:
         "trades": trades_n,
         "inventory": float(inventory),
         "fees": float(fees),
+        "K": k_now,
+        "spread": spread_now,
+        "fill_prob": fill_prob_now,
         "price_series": price_series,
         "pnl_series": pnl_series_out,
     }

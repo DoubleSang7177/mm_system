@@ -15,7 +15,7 @@ import pandas as pd
 from alpha import XGBoostAlphaConfig, XGBoostAlphaModel, build_ml_feature_matrix
 from backtest import BacktestConfig, BacktestResult, run_backtest
 from engine import ASConfig, AvellanedaStoikovEngine
-from features import rolling_volatility
+from features import estimate_liquidity_k, rolling_volatility
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -86,9 +86,17 @@ def build_market_from_raw(orderbook: pd.DataFrame, trades: pd.DataFrame) -> pd.D
     market["bid_size"] = market["bid_volume_1"].astype(float)
     market["ask_size"] = market["ask_volume_1"].astype(float)
     market["volume"] = agg["trade_volume"].to_numpy(dtype=float)
+    market["buy_volume"] = agg["buy_volume"].to_numpy(dtype=float)
+    market["sell_volume"] = agg["sell_volume"].to_numpy(dtype=float)
+    market["trade_count"] = agg["trade_count"].to_numpy(dtype=float)
 
     if "timestamp" in market.columns:
         market = market.sort_values("timestamp").reset_index(drop=True)
+
+    try:
+        market["liquidity_k"] = estimate_liquidity_k(ob, tr, window=500).reindex(market.index)
+    except Exception:
+        market["liquidity_k"] = float(np.clip(1.0 / 1e-6, 0.01, 100.0))
 
     return market
 
