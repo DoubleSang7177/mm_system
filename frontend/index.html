@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>MM Realtime Dashboard</title>
+    <link rel="stylesheet" href="/static/style.css" />
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  </head>
+  <body>
+    <div class="container">
+      <header class="header">
+        <h1>Market Making Realtime Dashboard</h1>
+        <div id="status" class="status">Connecting...</div>
+      </header>
+
+      <section class="cards">
+        <div class="card">
+          <div class="label">PnL</div>
+          <div id="pnl" class="value">0.00</div>
+        </div>
+        <div class="card">
+          <div class="label">IC</div>
+          <div id="ic" class="value neutral">0.0000</div>
+        </div>
+        <div class="card">
+          <div class="label">Accuracy</div>
+          <div id="accuracy" class="value neutral">0.00%</div>
+        </div>
+        <div class="card">
+          <div class="label">Trades</div>
+          <div id="trades" class="value neutral">0</div>
+        </div>
+        <div class="card">
+          <div class="label">Inventory</div>
+          <div id="inventory" class="value neutral">0.0000</div>
+        </div>
+        <div class="card">
+          <div class="label">Fees</div>
+          <div id="fees" class="value negative">0.00</div>
+        </div>
+      </section>
+
+      <section class="charts">
+        <div class="chart-card">
+          <div class="chart-title">Price Series</div>
+          <canvas id="priceChart"></canvas>
+        </div>
+        <div class="chart-card">
+          <div class="chart-title">PnL Series</div>
+          <canvas id="pnlChart"></canvas>
+        </div>
+      </section>
+    </div>
+
+    <script src="/static/app.js"></script>
+  </body>
+</html>
